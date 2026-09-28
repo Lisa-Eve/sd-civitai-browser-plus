@@ -12,6 +12,7 @@ import scripts.civitai_global as gl
 import scripts.civitai_download as _download
 import scripts.civitai_file_manage as _file
 import scripts.civitai_api as _api
+from scripts.civitai_storage import read_json, write_json
 
 def git_tag():
     try:
@@ -66,26 +67,18 @@ def saveSettings(ust, ct, pt, st, bf, cj, td, ol, hi, sn, ss, ts):
     }
     
     # Load the current contents of the config file into a dictionary
-    try:
-        with open(config, "r", encoding="utf8") as file:
-            data = json.load(file)
-    except:
-        print(f"Cannot save settings, failed to open \"{file}\"")
+    data = read_json(config)
+    if data is None:
+        print(f"Cannot save settings, failed to open \"{config}\"")
         print("Please try to manually repair the file or remove it to reset settings.")
         return
-
-    # Remove any keys containing the text `civitai_interface`
-    keys_to_remove = [key for key in data if "civitai_interface" in key]
-    for key in keys_to_remove:
-        del data[key]
 
     # Update the dictionary with the new settings
     data.update(settings_map)
 
     # Save the modified content back to the file
-    with open(config, 'w', encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-        print(f"Updated settings to: {config}")
+    write_json(config, data)
+    print(f"Updated settings to: {config}")
 
 def all_visible(html_check):
     return gr.Button.update(visible="model-checkbox" in html_check)
@@ -272,6 +265,7 @@ def on_ui_tabs():
                 overwrite_toggle = gr.Checkbox(elem_id="overwrite_toggle", label="Overwrite any existing files. (previews, HTMLs, tags, descriptions)", value=True, min_width=300)
                 skip_hash_toggle = gr.Checkbox(elem_id="skip_hash_toggle", label="One-Time Hash Generation for externally downloaded models.", value=True, min_width=300)
                 do_html_gen = gr.Checkbox(elem_id="do_html_gen", label="Save HTML file for each model when updating info & tags (increases process time).", value=False, min_width=300)
+                include_variants = gr.Checkbox(label="Count other base model variants as updates", value=False, min_width=300)
             with gr.Row():
                 save_all_tags = gr.Button(value="Update model info & tags", interactive=True, visible=True)
                 cancel_all_tags = gr.Button(value="Cancel updating model info & tags", interactive=False, visible=False)
@@ -286,6 +280,8 @@ def on_ui_tabs():
                 ver_search = gr.Button(value="Scan for available updates", interactive=True, visible=True)
                 cancel_ver_search = gr.Button(value="Cancel updates scan", interactive=False, visible=False)
                 load_to_browser = gr.Button(value="Load outdated models to browser", interactive=False, visible=False)
+                select_all_updates = gr.Button(value="Select all loaded updates", interactive=True)
+                queue_all_updates_btn = gr.Button(value="Queue all found updates", interactive=False)
             with gr.Row():
                 version_progress = gr.HTML(value='<div style="min-height: 0px;"></div>')
             with gr.Row():
@@ -388,6 +384,7 @@ def on_ui_tabs():
         download_selected.click(fn=None, _js="() => deselectAllModels()")
         
         select_all.click(fn=None, _js="() => selectAllModels()")
+        select_all_updates.click(fn=None, _js="() => selectAllUpdates()")
         
         list_models.select(fn=None, inputs=list_models, _js="(list_models) => select_model(list_models)")
         
@@ -638,6 +635,13 @@ def on_ui_tabs():
                 download_manager_html
             ]
         )
+
+        queue_all_updates_btn.click(
+            fn=_download.queue_all_updates,
+            inputs=[download_start, create_json, download_manager_html],
+            outputs=[download_model, cancel_model, cancel_all_model,
+                     download_start, download_progress, download_manager_html]
+        )
         
         
         for component in [download_start, queue_trigger]:
@@ -765,7 +769,8 @@ def on_ui_tabs():
             overwrite_toggle,
             tile_count_slider,
             skip_hash_toggle,
-            do_html_gen
+            do_html_gen,
+            include_variants
         ]
         
         load_to_browser_inputs = [
@@ -823,6 +828,10 @@ def on_ui_tabs():
                 version_progress
                 ]
         )
+        ver_search.click(
+            fn=lambda: gr.Button.update(interactive=False),
+            outputs=queue_all_updates_btn
+        )
         
         ver_start.change(
             fn=_file.file_scan,
@@ -844,6 +853,10 @@ def on_ui_tabs():
                 cancel_ver_search,
                 load_to_browser
             ]
+        )
+        ver_finish.change(
+            fn=lambda: gr.Button.update(interactive=bool(gl.update_items)),
+            outputs=queue_all_updates_btn
         )
         
         load_installed.click(

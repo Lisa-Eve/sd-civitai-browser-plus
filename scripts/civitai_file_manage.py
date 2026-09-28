@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from modules.shared import cmd_opts, opts
 from scripts.civitai_global import print, debug_print
 import scripts.civitai_global as gl
+from scripts.civitai_storage import is_model_sidecar, read_json, write_json
 import scripts.civitai_api as _api
 import scripts.civitai_file_manage as _file
 import scripts.civitai_download as _download
@@ -80,17 +81,10 @@ def delete_model(delete_finish=None, model_filename=None, model_string=None, lis
         sha256_upper = sha256.upper()
         for root, _, files in os.walk(model_folder, followlinks=True):
             for file in files:
-                if file.endswith('.json'):
+                if is_model_sidecar(root, file, files):
                     file_path = os.path.join(root, file)
-                    try:
-                        with open(file_path, 'r', encoding="utf-8") as json_file:
-                            data = json.load(json_file)
-                            file_sha256 = data.get('sha256', '')
-                            if file_sha256:
-                                file_sha256 = file_sha256.upper()
-                    except Exception as e:
-                        print(f"Failed to open: {file_path}: {e}")
-                        file_sha256 = "0"
+                    data = read_json(file_path)
+                    file_sha256 = data.get('sha256', '').upper() if data else ''
                         
                     if file_sha256 == sha256_upper:
                         unpack_list = data.get('unpackList', [])
@@ -326,17 +320,14 @@ def gen_sha256(file_path):
             with open(json_file, 'r', encoding="utf-8") as f:
                 data = json.load(f)
     
-            if 'sha256' in data and data['sha256']:
-                data['sha256'] = hash_value
+            data['sha256'] = hash_value
                 
-            with open(json_file, 'w', encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            write_json(json_file, data)
         except Exception as e:
             print(f"Failed to open {json_file}: {e}")
     else:
         data = {'sha256': hash_value}
-        with open(json_file, 'w', encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        write_json(json_file, data)
     
     return hash_value
 
@@ -602,8 +593,7 @@ def updateSubfolder(subfolderInput):
     elif action == "add":
         data[index] = value
 
-    with open(gl.subfolder_json, 'w') as f:
-        json.dump(data, f, indent=4)
+    write_json(gl.subfolder_json, data)
 
 def is_image_url(url):
     image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp']
@@ -683,8 +673,7 @@ def save_model_info(install_path, file_name, sub_folder, sha256=None, preview_ht
     if save_api_info:
         path_to_new_file = os.path.join(save_path, f'{filename}.api_info.json')
         if not os.path.exists(path_to_new_file) or overwrite_toggle:
-            with open(path_to_new_file, mode="w", encoding="utf-8") as f:
-                json.dump(gl.json_info, f, indent=4, ensure_ascii=False)
+            write_json(path_to_new_file, gl.json_info)
 
     
 def find_and_save(api_response, sha256=None, file_name=None, json_file=None, no_hash=None, overwrite_toggle=None):
@@ -749,8 +738,8 @@ def find_and_save(api_response, sha256=None, file_name=None, json_file=None, no_
                         content["sd version"] = base_model
                         changed = True
                     
-                    with open(json_file, 'w', encoding="utf-8") as f:
-                        json.dump(content, f, indent=4)
+                    if changed:
+                        write_json(json_file, content)
                         
                     if changed:
                         print(f"Model info saved to \"{json_file}\"")
@@ -813,8 +802,7 @@ def get_models(file_path, gen_hash=None):
                     data['modelVersionId'] = modelVersionId
                     data['sha256'] = sha256.upper()
                         
-                    with open(json_file, 'w', encoding="utf-8") as f:
-                        json.dump(data, f, indent=4)
+                    write_json(json_file, data)
                 except Exception as e:
                     print(f"Failed to open {json_file}: {e}")
             else:
@@ -823,8 +811,7 @@ def get_models(file_path, gen_hash=None):
                     'modelVersionId': modelVersionId,
                     'sha256': sha256.upper()
                     }
-                with open(json_file, 'w', encoding="utf-8") as f:
-                    json.dump(data, f, indent=4)
+                write_json(json_file, data)
         
         return modelId
     except requests.exceptions.Timeout:
@@ -837,29 +824,29 @@ def get_models(file_path, gen_hash=None):
         print(f"An error occurred for {file_path}: {str(e)}")
         return None
 
-def version_match(file_paths, api_response):
+def version_match(file_paths, api_response, include_variants=False):
     updated_models = []
     outdated_models = []
     sha256_hashes = {}
+    installed_version_ids = {}
     for file_path in file_paths:
         json_path = f"{os.path.splitext(file_path)[0]}.json"
-        if os.path.exists(json_path):
-            with open(json_path, 'r', encoding="utf-8") as f:
-                try:
-                    json_data = json.load(f)
-                    sha256 = json_data.get('sha256')
-                    if sha256:
-                        sha256_hashes[os.path.basename(file_path)] = sha256.upper()
-                except Exception as e:
-                    print(f"Failed to open {json_path}: {e}")
+        json_data = read_json(json_path)
+        if json_data and json_data.get('sha256'):
+            sha256_hashes[file_path] = json_data['sha256'].upper()
+        if json_data and json_data.get('modelId') and json_data.get('modelVersionId'):
+            installed_version_ids.setdefault(str(json_data['modelId']), set()).add(str(json_data['modelVersionId']))
         
     file_names_and_hashes = set()
     for file_path in file_paths:
         file_name = os.path.basename(file_path)
         file_name_without_ext = os.path.splitext(file_name)[0]
-        file_sha256 = sha256_hashes.get(file_name, "")
+        file_sha256 = sha256_hashes.get(file_path, "")
         if file_sha256: file_sha256 = file_sha256.upper()
-        file_names_and_hashes.add((file_name_without_ext, file_sha256))
+        file_names_and_hashes.add((file_name_without_ext.casefold(), file_sha256))
+    installed_hashes = {hash_value for _, hash_value in file_names_and_hashes if hash_value}
+    gl.update_preferred_versions = {}
+    gl.update_items = []
     
     for item in api_response.get('items', []):
         model_versions = item.get('modelVersions', [])
@@ -867,24 +854,42 @@ def version_match(file_paths, api_response):
         if not model_versions:
             continue
         
+        installed_versions = []
         for idx, model_version in enumerate(model_versions):
             files = model_version.get('files', [])
-            match_found = False
+            match_found = str(model_version.get('id')) in installed_version_ids.get(str(item['id']), set())
             for file_entry in files:
-                entry_name = os.path.splitext(file_entry.get('name', ''))[0]
+                entry_name = os.path.splitext(file_entry.get('name', ''))[0].casefold()
                 entry_sha256 = file_entry.get('hashes', {}).get('SHA256', "")
                 if entry_sha256: entry_sha256 = entry_sha256.upper()
                 
-                if (entry_name, entry_sha256) in file_names_and_hashes:
+                if (entry_name, entry_sha256) in file_names_and_hashes or (entry_sha256 and entry_sha256 in installed_hashes):
                     match_found = True
                     break
             
             if match_found:
-                if idx == 0:
-                    updated_models.append((f"&ids={item['id']}", item["name"]))
-                else:
-                    outdated_models.append((f"&ids={item['id']}", item["name"]))
-                break
+                installed_versions.append((idx, model_version))
+
+        if installed_versions:
+            if include_variants:
+                latest_installed = min(idx for idx, _ in installed_versions)
+                has_update = latest_installed > 0
+                preferred = model_versions[0] if has_update else None
+            else:
+                latest_for_base = {}
+                for idx, version in installed_versions:
+                    base = version.get('baseModel')
+                    latest_for_base[base] = min(idx, latest_for_base.get(base, idx))
+                candidates = [version for idx, version in enumerate(model_versions)
+                              if idx < latest_for_base.get(version.get('baseModel'), -1)]
+                has_update = bool(candidates)
+                preferred = candidates[0] if candidates else None
+            if preferred:
+                gl.update_preferred_versions[str(item['id'])] = preferred['id']
+            result = outdated_models if has_update else updated_models
+            result.append((f"&ids={item['id']}", item['name']))
+            if has_update:
+                gl.update_items.append(item)
                 
     return updated_models, outdated_models
 
@@ -914,12 +919,13 @@ def get_save_path_and_name(install_path, file_name, api_response, sub_folder=Non
     
     return save_path, name
 
-def file_scan(folders, ver_finish, tag_finish, installed_finish, preview_finish, overwrite_toggle, tile_count, gen_hash, create_html, progress=gr.Progress() if queue else None):
+def file_scan(folders, ver_finish, tag_finish, installed_finish, preview_finish, overwrite_toggle, tile_count, gen_hash, create_html, include_variants=False, progress=gr.Progress() if queue else None):
     global no_update
     proxies, ssl = _api.get_proxies()
     gl.scan_files = True
     no_update = False
     if from_ver:
+        gl.update_items = []
         number = _download.random_number(ver_finish)
     elif from_tag:
         number = _download.random_number(tag_finish)
@@ -1095,7 +1101,7 @@ def file_scan(folders, ver_finish, tag_finish, installed_finish, preview_finish,
         progress(1, desc="Processing final results...")
     
     if from_ver:
-        updated_models, outdated_models = version_match(file_paths, api_response)
+        updated_models, outdated_models = version_match(file_paths, api_response, include_variants)
         
         updated_set = set(updated_models)
         outdated_set = set(outdated_models)

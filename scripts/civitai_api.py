@@ -8,6 +8,7 @@ import os
 import re
 import datetime
 import platform
+import time
 from PIL import Image
 from io import BytesIO
 from collections import defaultdict
@@ -18,10 +19,55 @@ from modules.paths import models_path, extensions_dir, data_path
 from html import escape
 from scripts.civitai_global import print, debug_print
 import scripts.civitai_global as gl
+from scripts.civitai_storage import MODEL_EXTENSIONS, read_json
 import scripts.civitai_download as _download
 import scripts.civitai_file_manage as _file
 
 gl.init()
+_inventory_cache = {}
+
+
+def invalidate_inventory():
+    _inventory_cache.clear()
+
+
+def installed_inventory(folder):
+    """Avoid walking a large model tree on every Gradio selection or page change."""
+    folder = os.path.abspath(folder)
+    cached = _inventory_cache.get(folder)
+    if cached and time.monotonic() - cached[0] < 20:
+        return cached[1], cached[2]
+    names, hashes = set(), set()
+    locations = {}
+    if os.path.isdir(folder):
+        for root, _, files in os.walk(folder, followlinks=True):
+            model_stems = {os.path.splitext(name)[0].casefold() for name in files
+                           if os.path.splitext(name)[1].lower() in MODEL_EXTENSIONS}
+            for name in files:
+                names.add(name.casefold())
+                locations.setdefault(('name', name.casefold()), root)
+            for name in files:
+                if (name.lower().endswith('.json') and not name.lower().endswith('.cm-info.json')
+                        and name[:-5].casefold() in model_stems):
+                    metadata = read_json(os.path.join(root, name))
+                    if metadata and metadata.get('sha256'):
+                        value = metadata['sha256'].upper()
+                        hashes.add(value)
+                        locations.setdefault(('hash', value), root)
+    _inventory_cache[folder] = (time.monotonic(), names, hashes, locations)
+    return names, hashes
+
+
+def installed_location(folder, filename=None, sha256=None):
+    installed_inventory(folder)
+    locations = _inventory_cache[os.path.abspath(folder)][3]
+    if sha256:
+        match = locations.get(('hash', sha256.upper()))
+        if match:
+            return match
+    if filename:
+        return locations.get(('name', filename.casefold()))
+    return None
 
 def contenttype_folder(content_type, desc=None, fromCheck=False, custom_folder=None):
     use_LORA = getattr(opts, "use_LORA", False)
@@ -187,22 +233,9 @@ def model_list_html(json_data):
         model_folders.add(model_folder)
     
     for folder in model_folders:
-        for root, dirs, files in os.walk(folder, followlinks=True):
-            for file in files:
-                existing_files.add(file.lower())
-                if file.endswith('.json'):
-                    json_path = os.path.join(root, file)
-                    with open(json_path, 'r', encoding="utf-8") as f:
-                        try:
-                            json_file = json.load(f)
-                            if isinstance(json_file, dict):
-                                sha256 = json_file.get('sha256')
-                                if sha256:
-                                    existing_files_sha256.add(sha256.upper())
-                            else:
-                                print(f"Invalid JSON data in {json_path}. Expected a dictionary.")
-                        except Exception as e:
-                            print(f"Error decoding JSON in {json_path}: {e}")
+        names, hashes = installed_inventory(folder)
+        existing_files.update(names)
+        existing_files_sha256.update(hashes)
     
     for item in json_data['items']:
         model_id = item.get('id')
@@ -242,8 +275,8 @@ def model_list_html(json_data):
                 imgtag = f'<img src="./file=html/card-no-preview.png"></img>'
             
             installstatus = None
-            
-            for version in reversed(item['modelVersions']):
+            installed_bases = {}
+            for index, version in enumerate(item['modelVersions']):
                 for file in version.get('files', []):
                     file_name = os.path.splitext(file['name'])[0]
                     file_extension = os.path.splitext(file['name'])[1]
@@ -254,10 +287,14 @@ def model_list_html(json_data):
                     name_match = file_name.lower() in existing_files
                     sha256_match = file_sha256 in existing_files_sha256
                     if name_match or sha256_match:
-                        if version == item['modelVersions'][0]:
-                            installstatus = "civmodelcardinstalled"
-                        else:
-                            installstatus = "civmodelcardoutdated"
+                        base = version.get('baseModel')
+                        installed_bases[base] = min(index, installed_bases.get(base, index))
+            if installed_bases:
+                newer_same_base = any(
+                    index < installed_bases.get(version.get('baseModel'), -1)
+                    for index, version in enumerate(item['modelVersions'])
+                )
+                installstatus = "civmodelcardoutdated" if newer_same_base else "civmodelcardinstalled"
             model_name_js = model_name.replace("'", "\\'")
             model_string = escape(f"{model_name_js} ({model_id})")
             model_card = f'<figure class="civmodelcard {nsfw} {installstatus}" base-model="{baseModel}" date="{date}" onclick="select_model(\'{model_string}\', event)">'
@@ -351,6 +388,8 @@ def convert_LORA_LoCon(content_type):
     return content_type
 
 def initial_model_page(content_type=None, sort_type=None, period_type=None, use_search_term=None, search_term=None, current_page=None, base_filter=None, only_liked=None, nsfw=None, tile_count=None, from_update_tab=False):
+    if not from_update_tab:
+        gl.update_preferred_versions = {}
     content_type = convert_LORA_LoCon(content_type)
     current_inputs = (content_type, sort_type, period_type, use_search_term, search_term, tile_count, base_filter, nsfw)
     if current_inputs != gl.previous_inputs and gl.previous_inputs != None or not current_page:
@@ -509,28 +548,10 @@ def update_model_versions(model_id, json_input=None):
                     version_filename = f"{version_filename}_{version_file['id']}{version_extension}"
                     version_files.add((version['name'], version_filename, file_sha256))
 
-            for root, _, files in os.walk(model_folder, followlinks=True):
-                for file in files:
-                    if file.endswith('.json'):
-                        try:
-                            json_path = os.path.join(root, file)
-                            with open(json_path, 'r', encoding="utf-8") as f:
-                                json_data = json.load(f)
-                                if isinstance(json_data, dict):
-                                    if 'sha256' in json_data and json_data['sha256']:
-                                        sha256 = json_data.get('sha256', "").upper()
-                                        for version_name, _, file_sha256 in version_files:
-                                            if sha256 == file_sha256:
-                                                installed_versions.add(version_name)
-                                                break
-                        except Exception as e:
-                            print(f"failed to read: \"{file}\": {e}")
-
-                    #filename_check
-                    for version_name, version_filename, _ in version_files:
-                        if file.lower() == version_filename.lower():
-                            installed_versions.add(version_name)
-                            break
+            installed_names, installed_hashes = installed_inventory(model_folder)
+            for version_name, version_filename, file_sha256 in version_files:
+                if version_filename.casefold() in installed_names or (file_sha256 and file_sha256 in installed_hashes):
+                    installed_versions.add(version_name)
 
             version_names = list(versions_dict.keys())
             display_version_names = [f"{v} [Installed]" if v in installed_versions else v for v in version_names]
@@ -579,7 +600,7 @@ def extract_model_info(input_string):
 
     return name, int(id_number)
 
-def update_model_info(model_string=None, model_version=None, only_html=False, input_id=None, json_input=None, from_preview=False):
+def update_model_info(model_string=None, model_version=None, only_html=False, input_id=None, json_input=None, from_preview=False, version_id=None):
     video_playback = getattr(opts, "video_playback", True)
     meta_btn = getattr(opts, "individual_meta_btn", True)
     playback = ""
@@ -600,7 +621,7 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
     else:
         model_id = input_id
     
-    if model_version and "[Installed]" in model_version:
+    if isinstance(model_version, str) and "[Installed]" in model_version:
         model_version = model_version.replace(" [Installed]", "")
     if model_id:
         output_html = ""
@@ -638,13 +659,16 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
                 if model_desc:
                     model_desc = model_desc.replace('<img', '<img style="max-width: -webkit-fill-available;"')
                     model_desc = model_desc.replace('<code>', '<code style="text-wrap: wrap">')
-                if model_version is None:
-                    selected_version = item['modelVersions'][0]
-                else:
-                    for model in item['modelVersions']:
-                        if model['name'] == model_version:
-                            selected_version = model
-                            break
+                selected_version = next(
+                    (model for model in item['modelVersions']
+                     if version_id is not None and str(model['id']) == str(version_id)),
+                    None,
+                )
+                if selected_version is None:
+                    selected_version = next(
+                        (model for model in item['modelVersions'] if model['name'] == model_version),
+                        item['modelVersions'][0],
+                    )
                     
                 model_availability = selected_version.get('availability', 'Unknown')
                 model_date_published = selected_version.get('publishedAt', '').split('T')[0]
@@ -872,35 +896,11 @@ def update_model_info(model_string=None, model_version=None, only_html=False, in
         default_subfolder = "None"
         sub_folders = _file.getSubfolders(model_folder, output_basemodel, nsfw, model_uploader, model_name, model_id, version_name, version_id)
 
-        for root, dirs, files in os.walk(model_folder, followlinks=True):
-            for filename in files:
-                if filename.endswith('.json'):
-                    json_file_path = os.path.join(root, filename)
-                    with open(json_file_path, 'r', encoding="utf-8") as f:
-                        try:
-                            data = json.load(f)
-                            sha256 = data.get('sha256')
-                            if sha256:
-                                sha256 = sha256.upper()
-                            if sha256 == sha256_value:
-                                folder_location = root
-                                BtnDownInt = False
-                                BtnDel = True
-                                
-                                break
-                        except Exception as e:
-                            print(f"Error decoding JSON: {str(e)}")
-            else:
-                #filename_check
-                for filename in files:
-                    if filename.lower() == model_filename.lower() or filename.lower() == cleaned_name(model_filename).lower():
-                        folder_location = root
-                        BtnDownInt = False
-                        BtnDel = True
-                        break
-
-            if folder_location != "None":
-                break
+        match_location = installed_location(model_folder, cleaned_name(model_filename), sha256_value)
+        if match_location:
+            folder_location = match_location
+            BtnDownInt = False
+            BtnDel = True
 
         default_subfolder = sub_folder_value(content_type, desc)
         if default_subfolder != "None":
@@ -1027,26 +1027,10 @@ def update_file_info(model_string, model_version, file_metadata):
                                         model_folder = os.path.join(contenttype_folder("TextualInversion"))
                                 dl_url = file['downloadUrl']
                                 gl.json_info = item
-                                for root, _, files in os.walk(model_folder, followlinks=True):
-                                    if file_name in files:
-                                        installed = True
-                                        folder_location = root
-                                        break
-                                
-                                if not installed:
-                                    for root, _, files in os.walk(model_folder, followlinks=True):
-                                        for filename in files:
-                                            if filename.endswith('.json'):
-                                                with open(os.path.join(root, filename), 'r', encoding="utf-8") as f:
-                                                    try:
-                                                        data = json.load(f)
-                                                        sha256_value = data.get('sha256')
-                                                        if sha256_value != None and sha256_value.upper() == sha256:
-                                                            folder_location = root
-                                                            installed = True
-                                                            break
-                                                    except Exception as e:
-                                                        print(f"Error decoding JSON: {str(e)}")
+                                match_location = installed_location(model_folder, file_name, sha256)
+                                if match_location:
+                                    installed = True
+                                    folder_location = match_location
                                 default_sub = sub_folder_value(content_type, desc)
                                 if folder_location == "None":
                                     folder_location = model_folder

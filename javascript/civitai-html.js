@@ -920,6 +920,11 @@ function selectAllModels() {
     }
 }
 
+// Selects the currently loaded update results without toggling selected cards off.
+function selectAllUpdates() {
+    document.querySelectorAll('.model-checkbox:not(:checked)').forEach(sendClick);
+}
+
 // Deselects all models
 function deselectAllModels() {
     setTimeout(() => {

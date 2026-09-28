@@ -1,3 +1,11 @@
+## CivitAI Browser+ – lokale Weiterentwicklung
+
+Diese Version erhält die bisherigen WebUI-Einstellungen und ergänzt sicherere
+Metadaten, Downloads mit Fortsetzung, einen Speicherplatzcheck, schnellere
+Modellabfragen und einen variantenbewussten Update-Scan. Hinweise zum Wechsel
+stehen in [FORK_NOTES_DE.md](FORK_NOTES_DE.md). Das Originalprojekt bleibt
+unten dokumentiert und ist unter AGPL-3.0 lizenziert.
+
 <h1 align="center">I have unfortunately stopped developing this extension</h1>
 
 **This project has been archived as I'm no longer actively maintaining it. There are several reasons for this decision:**
